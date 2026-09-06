@@ -1,0 +1,36 @@
+name: v3.3 shadow backtest
+on:
+  workflow_dispatch:
+    inputs:
+      cutoff:
+        description: "Cutoff date YYYY-MM-DD"
+        required: true
+        default: "2023-10-15"
+      future_days:
+        description: "Future window days"
+        required: true
+        default: "180"
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/cache@v4
+        with:
+          path: cache/binance
+          key: binance-${{ runner.os }}-${{ inputs.cutoff }}-${{ hashFiles('universe_100.txt') }}
+          restore-keys: |
+            binance-${{ runner.os }}-
+      - run: pip install -r requirements.txt
+      - name: Run backtest
+        run: python backtest_v33.py --cutoff "${{ inputs.cutoff }}" --symbols universe_100.txt --future-days "${{ inputs.future_days }}" --outdir results
+      - uses: actions/upload-artifact@v4
+        with:
+          name: v33-backtest-${{ inputs.cutoff }}
+          path: results/
+          retention-days: 30
