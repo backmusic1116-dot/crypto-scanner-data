@@ -158,7 +158,7 @@ def classify(sym,d,cut,fwd):
     fire=T>=70 and safety>=55 and G>=65 and trans
     cls="FIRE" if fire else "SAFE" if safety>=55 and T>=40 else "REJECT"
     cc=float(pre.loc[ci,"close"]); fut=d[(d.date>cut)&(d.date<=cut+pd.Timedelta(days=fwd))]; fx=float(fut.high.max()/cc) if len(fut) else np.nan
-    return dict(symbol=sym,status="ok",cutoff=str(cut.date()),cutoff_close=cc,E=round(e["score"],2),S=round(s["score"],2),R=round(r["score"],2),G=round(G,2),safety=round(safety,2),T_score=round(T,2),P=round(P,2),engine=strong,state=state,transition_pass=bool(trans),class_=cls,future_max=round(fx,4) if pd.notna(fx) else None,hit_2x=bool(pd.notna(fx) and fx>=2),hit_3x=bool(pd.notna(fx) and fx>=3),hit_5x=bool(pd.notna(fx) and fx>=5),hit_10x=bool(pd.notna(fx) and fx>=10))
+    return {"symbol":sym,"status":"ok","cutoff":str(cut.date()),"cutoff_close":cc,"E":round(e["score"],2),"S":round(s["score"],2),"R":round(r["score"],2),"G":round(G,2),"safety":round(safety,2),"T_score":round(T,2),"P":round(P,2),"engine":strong,"state":state,"transition_pass":bool(trans),"class":cls,"future_max":round(fx,4) if pd.notna(fx) else None,"hit_2x":bool(pd.notna(fx) and fx>=2),"hit_3x":bool(pd.notna(fx) and fx>=3),"hit_5x":bool(pd.notna(fx) and fx>=5),"hit_10x":bool(pd.notna(fx) and fx>=10)}
 
 def wilson(k,n,z=1.95996398454):
     if not n:return (np.nan,np.nan)
@@ -175,7 +175,9 @@ def main():
         try:
             d=fetch(s,start,end); rows.append(classify(s,d,cut,x.future_days) if len(d)>=200 else {"symbol":s,"status":"insufficient_data"})
         except Exception as e: rows.append({"symbol":s,"status":"error","error":str(e)[:200]})
-    df=pd.DataFrame(rows); df=df.rename(columns={"class_":"class"})
+    df=pd.DataFrame(rows)
+    if "class" not in df.columns and "class_" in df.columns:
+        df=df.rename(columns={"class_":"class"})
     pred=[c for c in df.columns if not c.startswith("future_") and not c.startswith("hit_")]
     df[pred].to_csv(out/"frozen_predictions.csv",index=False); df.to_csv(out/"outcomes.csv",index=False)
     v=df[df.status=="ok"].copy(); base=float(v.hit_5x.mean()) if len(v) else np.nan; summ=[]
@@ -183,8 +185,8 @@ def main():
         g=v[v["class"]==cls]
         if not len(g):continue
         k=int(g.hit_5x.sum()); lo,hi=wilson(k,len(g)); k10=int(g.hit_10x.sum()); l10,h10=wilson(k10,len(g))
-        summ.append(dict(class_=cls,n=len(g),median_future_x=round(float(g.future_max.median()),3),mean_future_x=round(float(g.future_max.mean()),3),rate_2x=round(float(g.hit_2x.mean()),4),rate_3x=round(float(g.hit_3x.mean()),4),rate_5x=round(k/len(g),4),wilson5_low=round(lo,4),wilson5_high=round(hi,4),rate_10x=round(k10/len(g),4),wilson10_low=round(l10,4),wilson10_high=round(h10,4),enrichment5=round((k/len(g))/base,3) if base and base>0 else None))
-    pd.DataFrame(summ).rename(columns={"class_":"class"}).to_csv(out/"summary.csv",index=False)
+        summ.append({"class":cls,"n":len(g),"median_future_x":round(float(g.future_max.median()),3),"mean_future_x":round(float(g.future_max.mean()),3),"rate_2x":round(float(g.hit_2x.mean()),4),"rate_3x":round(float(g.hit_3x.mean()),4),"rate_5x":round(k/len(g),4),"wilson5_low":round(lo,4),"wilson5_high":round(hi,4),"rate_10x":round(k10/len(g),4),"wilson10_low":round(l10,4),"wilson10_high":round(h10,4),"enrichment5":round((k/len(g))/base,3) if base and base>0 else None})
+    pd.DataFrame(summ).to_csv(out/"summary.csv",index=False)
     print(pd.DataFrame(summ).to_string(index=False))
 
 if __name__=="__main__": main()
