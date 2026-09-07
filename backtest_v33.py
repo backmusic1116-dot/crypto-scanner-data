@@ -176,8 +176,6 @@ def main():
             d=fetch(s,start,end); rows.append(classify(s,d,cut,x.future_days) if len(d)>=200 else {"symbol":s,"status":"insufficient_data"})
         except Exception as e: rows.append({"symbol":s,"status":"error","error":str(e)[:200]})
     df=pd.DataFrame(rows)
-    if "class" not in df.columns and "class_" in df.columns:
-        df=df.rename(columns={"class_":"class"})
     pred=[c for c in df.columns if not c.startswith("future_") and not c.startswith("hit_")]
     df[pred].to_csv(out/"frozen_predictions.csv",index=False); df.to_csv(out/"outcomes.csv",index=False)
     v=df[df.status=="ok"].copy(); base=float(v.hit_5x.mean()) if len(v) else np.nan; summ=[]
