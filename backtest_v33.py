@@ -139,7 +139,7 @@ def R(d,ci):
 
 def classify(sym,d,cut,fwd):
     d=indicators(d); ix=d.index[d.date<=cut]
-    if not len(ix) or ix[-1]<180:return {"symbol":sym,"status":"insufficient_pre"}
+    if not len(ix) or ix[-1]<180:return {"symbol":sym,"status":"insufficient_pre","class":None}
     ci=int(ix[-1]); pre=d.loc[:ci]; e,s,r=E(pre,ci),S(pre,ci),R(pre,ci)
     rec=pre.loc[max(0,ci-59):ci]; prv=pre.loc[max(0,ci-119):max(0,ci-60)]
     dd=float(rec.low.min()/prv.low.min()-1) if len(prv) else -1; floor=100 if dd>=.1 else 75 if dd>=-.05 else 40 if dd>=-.1 else 0
@@ -173,11 +173,25 @@ def main():
     for n,s in enumerate(syms,1):
         print(f"[{n}/{len(syms)}] {s}",flush=True)
         try:
-            d=fetch(s,start,end); rows.append(classify(s,d,cut,x.future_days) if len(d)>=200 else {"symbol":s,"status":"insufficient_data"})
-        except Exception as e: rows.append({"symbol":s,"status":"error","error":str(e)[:200]})
+            d=fetch(s,start,end); rows.append(classify(s,d,cut,x.future_days) if len(d)>=200 else {"symbol":s,"status":"insufficient_data","class":None})
+        except Exception as e: rows.append({"symbol":s,"status":"error","class":None,"error":str(e)[:200]})
     df=pd.DataFrame(rows)
+    if "class" not in df.columns:
+        df["class"]=None
+    print("DataFrame columns:",list(df.columns))
+    print("Status counts:")
+    print(df["status"].value_counts(dropna=False).to_string())
+    ok_count=int((df["status"]=="ok").sum())
+    print("status=='ok' count:",ok_count)
+    errors=df[df["status"]=="error"]
+    if len(errors):
+        print("Representative errors (up to 10):")
+        cols=[c for c in ["symbol","error"] if c in errors.columns]
+        print(errors[cols].head(10).to_string(index=False))
     pred=[c for c in df.columns if not c.startswith("future_") and not c.startswith("hit_")]
     df[pred].to_csv(out/"frozen_predictions.csv",index=False); df.to_csv(out/"outcomes.csv",index=False)
+    if ok_count==0:
+        raise RuntimeError("No status=='ok' rows were produced; inspect status counts and representative errors above for the upstream cause.")
     v=df[df.status=="ok"].copy(); base=float(v.hit_5x.mean()) if len(v) else np.nan; summ=[]
     for cls in ["FIRE","SAFE","REJECT"]:
         g=v[v["class"]==cls]
