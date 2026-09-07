@@ -1,94 +1,157 @@
-import argparse, math, time
+import argparse, math, time, io, zipfile
 from pathlib import Path
 import numpy as np, pandas as pd, requests
 
-HOSTS=["https://api.binance.com","https://api1.binance.com","https://api-gcp.binance.com"]
-BYBIT_HOST="https://api.bybit.com"
-CACHE=Path("cache/binance"); CACHE.mkdir(parents=True,exist_ok=True)
-SOURCE_STATS={"binance_success":0,"binance_blocked":0,"binance_failed":0,"bybit_success":0,"bybit_failed":0}
+PUBLIC_BASE="https://data.binance.vision"
+MARKET_DATA_HOST="https://data-api.binance.vision"
+CACHE=Path("cache/binance_public"); CACHE.mkdir(parents=True,exist_ok=True)
+SOURCE_STATS={"public_zip_success":0,"public_zip_missing":0,"market_api_success":0,"market_api_failed":0}
+KLINE_COLS=["open_time","open","high","low","close","volume","close_time","quote_volume","trades","taker_buy_base","taker_buy_quote","ignore"]
 
 def clip(x,a=0,b=100): return float(max(a,min(b,0 if pd.isna(x) else x)))
 def tsms(x): return int(pd.Timestamp(x).timestamp()*1000)
 
-def _normalize(rows):
-    if not rows:return pd.DataFrame()
-    d=pd.DataFrame(rows,columns=["ot","open","high","low","close","volume"])
-    for c in ["open","high","low","close","volume"]: d[c]=pd.to_numeric(d[c],errors="coerce")
-    d["date"]=pd.to_datetime(d["ot"],unit="ms")
+def _parse_open_time(s):
+    v=pd.to_numeric(s,errors="coerce")
+    out=pd.Series(pd.NaT,index=v.index,dtype="datetime64[ns]")
+    ms=v.notna() & (v.abs()<1e14)
+    us=v.notna() & ~ms
+    if ms.any(): out.loc[ms]=pd.to_datetime(v.loc[ms],unit="ms",errors="coerce")
+    if us.any(): out.loc[us]=pd.to_datetime(v.loc[us],unit="us",errors="coerce")
+    return out
+
+def _parse_zip_bytes(content):
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as z:
+            names=[n for n in z.namelist() if not n.endswith("/")]
+            if not names: raise RuntimeError("ZIP contains no CSV file")
+            raw=z.read(names[0])
+        d=pd.read_csv(io.BytesIO(raw),header=None,names=KLINE_COLS)
+    except Exception as e:
+        raise RuntimeError(f"PUBLIC_ZIP_PARSE_FAILED: {e}") from e
+    if d.empty: return pd.DataFrame(columns=["date","open","high","low","close","volume"])
+    d["open_time"]=pd.to_numeric(d["open_time"],errors="coerce")
+    d=d[d["open_time"].notna()].copy()
+    for c in ["open","high","low","close","volume"]:
+        d[c]=pd.to_numeric(d[c],errors="coerce")
+    d["date"]=_parse_open_time(d["open_time"])
+    d=d.dropna(subset=["date","open","high","low","close","volume"])
     return d[["date","open","high","low","close","volume"]].drop_duplicates("date").sort_values("date").reset_index(drop=True)
 
-def _binance_cache(sym,start,end): return CACHE/f"binance_{sym}_{start.date()}_{end.date()}.csv"
-def _bybit_cache(sym,start,end): return CACHE/f"bybit_{sym}_{start.date()}_{end.date()}.csv"
+def _month_cache(sym,period):
+    p=CACHE/"monthly"/sym; p.mkdir(parents=True,exist_ok=True)
+    return p/f"{sym}-1d-{period.year:04d}-{period.month:02d}.zip"
 
-def fetch_binance(sym,start,end):
-    f=_binance_cache(sym,start,end)
-    if f.exists():
-        SOURCE_STATS["binance_success"]+=1
-        return pd.read_csv(f,parse_dates=["date"])
-    rows=[]; cur=start; blocked=False; errors=[]
-    while cur<=end:
-        ok=False
-        for host in HOSTS:
-            try:
-                r=requests.get(host+"/api/v3/klines",params=dict(symbol=sym,interval="1d",startTime=tsms(cur),endTime=tsms(end+pd.Timedelta(days=1))-1,limit=1000),timeout=20)
-                if r.ok:
-                    b=r.json()
-                    if not b: cur=end+pd.Timedelta(days=1); ok=True; break
-                    rows += [[x[0],x[1],x[2],x[3],x[4],x[5]] for x in b]
-                    cur=pd.to_datetime(b[-1][0],unit="ms")+pd.Timedelta(days=1); ok=True; time.sleep(.05); break
-                text=r.text[:160]
-                errors.append(f"{host}:{r.status_code}:{text}")
-                if r.status_code in (403,451) or "restricted location" in text.lower() or "service unavailable from a restricted location" in text.lower():
-                    blocked=True
-            except Exception as e:
-                errors.append(f"{host}:{e}")
-        if not ok:
-            if blocked:
-                SOURCE_STATS["binance_blocked"]+=1
-                raise PermissionError("BINANCE_REGION_BLOCKED | "+" | ".join(errors[-3:]))
-            SOURCE_STATS["binance_failed"]+=1
-            raise RuntimeError("BINANCE_FAILED | "+" | ".join(errors[-3:]))
-    d=_normalize(rows)
+def _month_url(sym,period):
+    name=f"{sym}-1d-{period.year:04d}-{period.month:02d}.zip"
+    return f"{PUBLIC_BASE}/data/spot/monthly/klines/{sym}/1d/{name}"
+
+def fetch_public_month(sym,period,count_stats=True,use_cache=True):
+    f=_month_cache(sym,period); url=_month_url(sym,period)
+    if use_cache and f.exists():
+        try:
+            d=_parse_zip_bytes(f.read_bytes())
+            if count_stats: SOURCE_STATS["public_zip_success"]+=1
+            return d
+        except Exception:
+            f.unlink(missing_ok=True)
+    r=requests.get(url,timeout=30)
+    if r.status_code==404:
+        if count_stats: SOURCE_STATS["public_zip_missing"]+=1
+        return pd.DataFrame(columns=["date","open","high","low","close","volume"])
+    if not r.ok:
+        raise RuntimeError(f"PUBLIC_ZIP_HTTP_{r.status_code}: {url} | {r.text[:200]}")
+    d=_parse_zip_bytes(r.content)
     if d.empty:
-        SOURCE_STATS["binance_failed"]+=1
-        raise RuntimeError("BINANCE_NO_DATA")
-    d.to_csv(f,index=False); SOURCE_STATS["binance_success"]+=1
+        raise RuntimeError(f"PUBLIC_ZIP_EMPTY_AFTER_PARSE: {url}")
+    f.write_bytes(r.content)
+    if count_stats: SOURCE_STATS["public_zip_success"]+=1
     return d
 
-def fetch_bybit(sym,start,end):
-    f=_bybit_cache(sym,start,end)
-    if f.exists():
-        SOURCE_STATS["bybit_success"]+=1
-        return pd.read_csv(f,parse_dates=["date"])
+def fetch_market_api(sym,start,end):
+    rows=[]; cur=pd.Timestamp(start)
     try:
-        r=requests.get(BYBIT_HOST+"/v5/market/kline",params=dict(category="spot",symbol=sym,interval="D",start=tsms(start),end=tsms(end+pd.Timedelta(days=1))-1,limit=1000),timeout=20)
-        if not r.ok:
-            raise RuntimeError(f"HTTP {r.status_code}:{r.text[:160]}")
-        j=r.json()
-        if j.get("retCode")!=0:
-            raise RuntimeError(f"retCode={j.get('retCode')} retMsg={j.get('retMsg')}")
-        b=j.get("result",{}).get("list",[])
-        if not b:
+        while cur<=end:
+            r=requests.get(
+                MARKET_DATA_HOST+"/api/v3/klines",
+                params=dict(symbol=sym,interval="1d",startTime=tsms(cur),endTime=tsms(end+pd.Timedelta(days=1))-1,limit=1000),
+                timeout=20,
+            )
+            if not r.ok:
+                raise RuntimeError(f"HTTP {r.status_code}:{r.text[:200]}")
+            b=r.json()
+            if not b: break
+            rows += [[x[0],x[1],x[2],x[3],x[4],x[5]] for x in b]
+            nxt=pd.to_datetime(b[-1][0],unit="ms")+pd.Timedelta(days=1)
+            if nxt<=cur: break
+            cur=nxt
+            time.sleep(.05)
+        if not rows:
             raise RuntimeError("NO_DATA")
-        rows=[[x[0],x[1],x[2],x[3],x[4],x[5]] for x in b]
-        d=_normalize(rows)
+        d=pd.DataFrame(rows,columns=["open_time","open","high","low","close","volume"])
+        for c in ["open","high","low","close","volume"]: d[c]=pd.to_numeric(d[c],errors="coerce")
+        d["date"]=pd.to_datetime(pd.to_numeric(d["open_time"],errors="coerce"),unit="ms",errors="coerce")
+        d=d[["date","open","high","low","close","volume"]].dropna().drop_duplicates("date").sort_values("date").reset_index(drop=True)
         d=d[(d.date>=start)&(d.date<=end)].copy()
-        if d.empty:
-            raise RuntimeError("NO_DATA_IN_RANGE")
-        d.to_csv(f,index=False); SOURCE_STATS["bybit_success"]+=1
+        if d.empty: raise RuntimeError("NO_DATA_IN_RANGE")
+        SOURCE_STATS["market_api_success"]+=1
         return d
     except Exception:
-        SOURCE_STATS["bybit_failed"]+=1
+        SOURCE_STATS["market_api_failed"]+=1
         raise
 
 def fetch(sym,start,end):
+    months=pd.period_range(start=pd.Timestamp(start).to_period("M"),end=pd.Timestamp(end).to_period("M"),freq="M")
+    parts=[]; missing=[]
+    for period in months:
+        d=fetch_public_month(sym,period)
+        if d.empty:
+            missing.append(period)
+        else:
+            parts.append(d)
+    used_api=False
+    now=pd.Timestamp.utcnow().tz_localize(None)
+    recent_floor=(now-pd.Timedelta(days=62)).to_period("M")
+    recent_missing=[p for p in missing if p>=recent_floor]
+    if recent_missing:
+        gap_start=max(pd.Timestamp(start),recent_missing[0].start_time)
+        if parts:
+            last=max(x.date.max() for x in parts)
+            gap_start=max(gap_start,last+pd.Timedelta(days=1))
+        if gap_start<=end:
+            try:
+                api=fetch_market_api(sym,gap_start,end)
+                parts.append(api); used_api=True
+            except Exception:
+                pass
+    if not parts:
+        return pd.DataFrame(columns=["date","open","high","low","close","volume"]),"binance_public_zip"
+    d=pd.concat(parts,ignore_index=True)
+    d=d.drop_duplicates("date").sort_values("date").reset_index(drop=True)
+    d=d[(d.date>=start)&(d.date<=end)].copy().reset_index(drop=True)
+    source="binance_market_data_api" if used_api else "binance_public_zip"
+    return d,source
+
+def preflight_public_zip(cut,start,end):
+    months=list(pd.period_range(start=pd.Timestamp(start).to_period("M"),end=pd.Timestamp(end).to_period("M"),freq="M"))
+    now_month=pd.Timestamp.utcnow().tz_localize(None).to_period("M")
+    candidates=[p for p in reversed(months) if p.days_in_month>=30 and p<now_month]
+    if not candidates:
+        raise RuntimeError("PRE-FLIGHT FAILED: no completed >=30-day month exists in requested range")
+    period=candidates[0]; url=_month_url("BTCUSDT",period)
+    print(f"PRE-FLIGHT TEST: BTCUSDT {period} | {url}")
     try:
-        return fetch_binance(sym,start,end),"binance"
-    except PermissionError as be:
-        try:
-            return fetch_bybit(sym,start,end),"bybit"
-        except Exception as fe:
-            raise RuntimeError(f"{be}; BYBIT_FALLBACK_FAILED | {fe}")
+        r=requests.get(url,timeout=30)
+        if not r.ok:
+            raise RuntimeError(f"ZIP download HTTP {r.status_code}: {r.text[:200]}")
+        print(f"PRE-FLIGHT ZIP download: OK HTTP {r.status_code}, bytes={len(r.content)}")
+        d=_parse_zip_bytes(r.content)
+        print(f"PRE-FLIGHT parse: OK, rows={len(d)}")
+        if len(d)<30:
+            raise RuntimeError(f"parsed rows={len(d)} (<30)")
+        print("PRE-FLIGHT PASS")
+    except Exception as e:
+        raise RuntimeError(f"PRE-FLIGHT FAILED: BTCUSDT {period} | {e}") from e
 
 def indicators(d):
     d=d.copy(); pc=d.close.shift()
@@ -229,7 +292,8 @@ def main():
     cut=pd.Timestamp(x.cutoff); start=cut-pd.Timedelta(days=420); end=cut+pd.Timedelta(days=x.future_days)
     syms=[s.strip().upper() for s in Path(x.symbols).read_text().splitlines() if s.strip() and not s.startswith("#")]
     out=Path(x.outdir); out.mkdir(exist_ok=True); rows=[]
-    print("Data source priority: Binance spot REST -> Bybit spot REST fallback on Binance 451/403 regional block")
+    print("Data source priority: Binance official public monthly ZIP -> data-api.binance.vision recent-tail fallback")
+    preflight_public_zip(cut,start,end)
     print("Source stats (initial):",SOURCE_STATS)
     for n,s in enumerate(syms,1):
         print(f"[{n}/{len(syms)}] {s}",flush=True)
@@ -242,10 +306,8 @@ def main():
             rows.append({"symbol":s,"status":"error","class":None,"data_source":None,"error":str(e)[:500]})
     print("Source stats (final):",SOURCE_STATS)
     df=pd.DataFrame(rows)
-    if "class" not in df.columns:
-        df["class"]=None
-    if "data_source" not in df.columns:
-        df["data_source"]=None
+    if "class" not in df.columns: df["class"]=None
+    if "data_source" not in df.columns: df["data_source"]=None
     print("DataFrame columns:",list(df.columns))
     print("Status counts:")
     print(df["status"].value_counts(dropna=False).to_string())
@@ -258,15 +320,26 @@ def main():
         print(errors[cols].head(10).to_string(index=False))
     pred=[c for c in df.columns if not c.startswith("future_") and not c.startswith("hit_")]
     df[pred].to_csv(out/"frozen_predictions.csv",index=False); df.to_csv(out/"outcomes.csv",index=False)
-    if ok_count==0:
-        raise RuntimeError("No status=='ok' rows were produced; inspect source stats, status counts and representative errors above for the upstream cause.")
-    v=df[df.status=="ok"].copy(); base=float(v.hit_5x.mean()) if len(v) else np.nan; summ=[]
+
+    if ok_count<=0:
+        raise RuntimeError("SELF-CHECK FAILED: status=='ok' must be > 0; inspect source stats and errors above.")
+    if "class" not in df.columns:
+        raise RuntimeError("SELF-CHECK FAILED: DataFrame is missing class column.")
+    v=df[df.status=="ok"].copy()
+    if "future_max" not in v.columns or not pd.to_numeric(v["future_max"],errors="coerce").notna().any():
+        raise RuntimeError("SELF-CHECK FAILED: future multiple (future_max) is not calculable for any ok row.")
+
+    base=float(v.hit_5x.mean()) if len(v) else np.nan; summ=[]
     for cls in ["FIRE","SAFE","REJECT"]:
         g=v[v["class"]==cls]
         if not len(g):continue
         k=int(g.hit_5x.sum()); lo,hi=wilson(k,len(g)); k10=int(g.hit_10x.sum()); l10,h10=wilson(k10,len(g))
         summ.append({"class":cls,"n":len(g),"median_future_x":round(float(g.future_max.median()),3),"mean_future_x":round(float(g.future_max.mean()),3),"rate_2x":round(float(g.hit_2x.mean()),4),"rate_3x":round(float(g.hit_3x.mean()),4),"rate_5x":round(k/len(g),4),"wilson5_low":round(lo,4),"wilson5_high":round(hi,4),"rate_10x":round(k10/len(g),4),"wilson10_low":round(l10,4),"wilson10_high":round(h10,4),"enrichment5":round((k/len(g))/base,3) if base and base>0 else None})
-    pd.DataFrame(summ).to_csv(out/"summary.csv",index=False)
-    print(pd.DataFrame(summ).to_string(index=False))
+    summary_df=pd.DataFrame(summ)
+    if summary_df.empty or "class" not in summary_df.columns:
+        raise RuntimeError("SELF-CHECK FAILED: summary could not be generated from ok rows.")
+    summary_df.to_csv(out/"summary.csv",index=False)
+    print("SELF-CHECK PASS: ok rows > 0, class present, future multiple calculable, summary generated")
+    print(summary_df.to_string(index=False))
 
 if __name__=="__main__": main()
