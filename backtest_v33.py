@@ -3,33 +3,92 @@ from pathlib import Path
 import numpy as np, pandas as pd, requests
 
 HOSTS=["https://api.binance.com","https://api1.binance.com","https://api-gcp.binance.com"]
+BYBIT_HOST="https://api.bybit.com"
 CACHE=Path("cache/binance"); CACHE.mkdir(parents=True,exist_ok=True)
+SOURCE_STATS={"binance_success":0,"binance_blocked":0,"binance_failed":0,"bybit_success":0,"bybit_failed":0}
 
 def clip(x,a=0,b=100): return float(max(a,min(b,0 if pd.isna(x) else x)))
 def tsms(x): return int(pd.Timestamp(x).timestamp()*1000)
 
-def fetch(sym,start,end):
-    f=CACHE/f"{sym}_{start.date()}_{end.date()}.csv"
-    if f.exists(): return pd.read_csv(f,parse_dates=["date"])
-    rows=[]; cur=start
+def _normalize(rows):
+    if not rows:return pd.DataFrame()
+    d=pd.DataFrame(rows,columns=["ot","open","high","low","close","volume"])
+    for c in ["open","high","low","close","volume"]: d[c]=pd.to_numeric(d[c],errors="coerce")
+    d["date"]=pd.to_datetime(d["ot"],unit="ms")
+    return d[["date","open","high","low","close","volume"]].drop_duplicates("date").sort_values("date").reset_index(drop=True)
+
+def _binance_cache(sym,start,end): return CACHE/f"binance_{sym}_{start.date()}_{end.date()}.csv"
+def _bybit_cache(sym,start,end): return CACHE/f"bybit_{sym}_{start.date()}_{end.date()}.csv"
+
+def fetch_binance(sym,start,end):
+    f=_binance_cache(sym,start,end)
+    if f.exists():
+        SOURCE_STATS["binance_success"]+=1
+        return pd.read_csv(f,parse_dates=["date"])
+    rows=[]; cur=start; blocked=False; errors=[]
     while cur<=end:
-        ok=False; err=""
+        ok=False
         for host in HOSTS:
             try:
                 r=requests.get(host+"/api/v3/klines",params=dict(symbol=sym,interval="1d",startTime=tsms(cur),endTime=tsms(end+pd.Timedelta(days=1))-1,limit=1000),timeout=20)
                 if r.ok:
                     b=r.json()
                     if not b: cur=end+pd.Timedelta(days=1); ok=True; break
-                    rows+=b; cur=pd.to_datetime(b[-1][0],unit="ms")+pd.Timedelta(days=1); ok=True; time.sleep(.05); break
-                err=f"{r.status_code}:{r.text[:80]}"
-            except Exception as e: err=str(e)
-        if not ok: raise RuntimeError(err)
-    if not rows: return pd.DataFrame()
-    d=pd.DataFrame(rows,columns=["ot","open","high","low","close","volume","ct","qv","n","tb","tq","x"])
-    for c in ["open","high","low","close","volume"]: d[c]=pd.to_numeric(d[c],errors="coerce")
-    d["date"]=pd.to_datetime(d["ot"],unit="ms")
-    d=d[["date","open","high","low","close","volume"]].drop_duplicates("date").sort_values("date")
-    d.to_csv(f,index=False); return d
+                    rows += [[x[0],x[1],x[2],x[3],x[4],x[5]] for x in b]
+                    cur=pd.to_datetime(b[-1][0],unit="ms")+pd.Timedelta(days=1); ok=True; time.sleep(.05); break
+                text=r.text[:160]
+                errors.append(f"{host}:{r.status_code}:{text}")
+                if r.status_code in (403,451) or "restricted location" in text.lower() or "service unavailable from a restricted location" in text.lower():
+                    blocked=True
+            except Exception as e:
+                errors.append(f"{host}:{e}")
+        if not ok:
+            if blocked:
+                SOURCE_STATS["binance_blocked"]+=1
+                raise PermissionError("BINANCE_REGION_BLOCKED | "+" | ".join(errors[-3:]))
+            SOURCE_STATS["binance_failed"]+=1
+            raise RuntimeError("BINANCE_FAILED | "+" | ".join(errors[-3:]))
+    d=_normalize(rows)
+    if d.empty:
+        SOURCE_STATS["binance_failed"]+=1
+        raise RuntimeError("BINANCE_NO_DATA")
+    d.to_csv(f,index=False); SOURCE_STATS["binance_success"]+=1
+    return d
+
+def fetch_bybit(sym,start,end):
+    f=_bybit_cache(sym,start,end)
+    if f.exists():
+        SOURCE_STATS["bybit_success"]+=1
+        return pd.read_csv(f,parse_dates=["date"])
+    try:
+        r=requests.get(BYBIT_HOST+"/v5/market/kline",params=dict(category="spot",symbol=sym,interval="D",start=tsms(start),end=tsms(end+pd.Timedelta(days=1))-1,limit=1000),timeout=20)
+        if not r.ok:
+            raise RuntimeError(f"HTTP {r.status_code}:{r.text[:160]}")
+        j=r.json()
+        if j.get("retCode")!=0:
+            raise RuntimeError(f"retCode={j.get('retCode')} retMsg={j.get('retMsg')}")
+        b=j.get("result",{}).get("list",[])
+        if not b:
+            raise RuntimeError("NO_DATA")
+        rows=[[x[0],x[1],x[2],x[3],x[4],x[5]] for x in b]
+        d=_normalize(rows)
+        d=d[(d.date>=start)&(d.date<=end)].copy()
+        if d.empty:
+            raise RuntimeError("NO_DATA_IN_RANGE")
+        d.to_csv(f,index=False); SOURCE_STATS["bybit_success"]+=1
+        return d
+    except Exception:
+        SOURCE_STATS["bybit_failed"]+=1
+        raise
+
+def fetch(sym,start,end):
+    try:
+        return fetch_binance(sym,start,end),"binance"
+    except PermissionError as be:
+        try:
+            return fetch_bybit(sym,start,end),"bybit"
+        except Exception as fe:
+            raise RuntimeError(f"{be}; BYBIT_FALLBACK_FAILED | {fe}")
 
 def indicators(d):
     d=d.copy(); pc=d.close.shift()
@@ -170,14 +229,23 @@ def main():
     cut=pd.Timestamp(x.cutoff); start=cut-pd.Timedelta(days=420); end=cut+pd.Timedelta(days=x.future_days)
     syms=[s.strip().upper() for s in Path(x.symbols).read_text().splitlines() if s.strip() and not s.startswith("#")]
     out=Path(x.outdir); out.mkdir(exist_ok=True); rows=[]
+    print("Data source priority: Binance spot REST -> Bybit spot REST fallback on Binance 451/403 regional block")
+    print("Source stats (initial):",SOURCE_STATS)
     for n,s in enumerate(syms,1):
         print(f"[{n}/{len(syms)}] {s}",flush=True)
         try:
-            d=fetch(s,start,end); rows.append(classify(s,d,cut,x.future_days) if len(d)>=200 else {"symbol":s,"status":"insufficient_data","class":None})
-        except Exception as e: rows.append({"symbol":s,"status":"error","class":None,"error":str(e)[:200]})
+            d,source=fetch(s,start,end)
+            rec=classify(s,d,cut,x.future_days) if len(d)>=200 else {"symbol":s,"status":"insufficient_data","class":None}
+            rec["data_source"]=source
+            rows.append(rec)
+        except Exception as e:
+            rows.append({"symbol":s,"status":"error","class":None,"data_source":None,"error":str(e)[:500]})
+    print("Source stats (final):",SOURCE_STATS)
     df=pd.DataFrame(rows)
     if "class" not in df.columns:
         df["class"]=None
+    if "data_source" not in df.columns:
+        df["data_source"]=None
     print("DataFrame columns:",list(df.columns))
     print("Status counts:")
     print(df["status"].value_counts(dropna=False).to_string())
@@ -186,12 +254,12 @@ def main():
     errors=df[df["status"]=="error"]
     if len(errors):
         print("Representative errors (up to 10):")
-        cols=[c for c in ["symbol","error"] if c in errors.columns]
+        cols=[c for c in ["symbol","data_source","error"] if c in errors.columns]
         print(errors[cols].head(10).to_string(index=False))
     pred=[c for c in df.columns if not c.startswith("future_") and not c.startswith("hit_")]
     df[pred].to_csv(out/"frozen_predictions.csv",index=False); df.to_csv(out/"outcomes.csv",index=False)
     if ok_count==0:
-        raise RuntimeError("No status=='ok' rows were produced; inspect status counts and representative errors above for the upstream cause.")
+        raise RuntimeError("No status=='ok' rows were produced; inspect source stats, status counts and representative errors above for the upstream cause.")
     v=df[df.status=="ok"].copy(); base=float(v.hit_5x.mean()) if len(v) else np.nan; summ=[]
     for cls in ["FIRE","SAFE","REJECT"]:
         g=v[v["class"]==cls]
